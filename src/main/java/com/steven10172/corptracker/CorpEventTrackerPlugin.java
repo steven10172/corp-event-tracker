@@ -28,15 +28,16 @@ import net.runelite.client.util.ImageUtil;
 import net.runelite.http.api.item.ItemPrice;
 
 import javax.inject.Inject;
-import javax.swing.SwingUtilities;
-import java.awt.Graphics2D;
-import java.awt.Image;
+import javax.swing.*;
+import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.regex.Matcher;
@@ -48,8 +49,9 @@ import java.util.regex.Pattern;
 )
 public class CorpEventTrackerPlugin extends Plugin {
 	private final Pattern DROP_MESSAGE = Pattern.compile("<col=005f00>(.*) received a drop: (.+)</col>");
+	private final Pattern VALUABLE_DROP_MESSAGE = Pattern.compile("<col=ef1020>Valuable drop: (.*) \\((.*)\\)</col>");
 	private final Pattern DROP_QTY = Pattern.compile("(.+) x (.+)");
-	private final Set<String> participants = new HashSet<>();
+	private final Set<String> participants = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
 	private final int BOSS_DELETE_IN_PROG_KILL_MS = 28 * 1000; // Corp respawn is 30 seconds
 
 	private UUID killId;
@@ -58,6 +60,7 @@ public class CorpEventTrackerPlugin extends Plugin {
 	private NavigationButton navButton;
 	private Thread bosskillExpiredThread;
 	private GameState lastGameState;
+	private Timer checkForParticipantsTimer = null;
 
 	@Inject
 	private ItemManager itemManager;
@@ -106,6 +109,10 @@ public class CorpEventTrackerPlugin extends Plugin {
 		this.killId = null;
 		this.participants.clear();
 		this.clearBossExpireThread();
+		if (this.checkForParticipantsTimer != null) {
+			this.checkForParticipantsTimer.cancel();
+			this.checkForParticipantsTimer = null;
+		}
 		clientToolbar.removeNavigation(navButton);
 	}
 
@@ -122,6 +129,26 @@ public class CorpEventTrackerPlugin extends Plugin {
 
 			// This is a new kill
 			this.createAndLogNewKillIfNotPresent();
+
+			// Cancel existing timer
+			if (this.checkForParticipantsTimer != null) {
+				this.checkForParticipantsTimer.cancel();
+			}
+
+			this.checkForParticipantsTimer = new Timer();
+			checkForParticipantsTimer.scheduleAtFixedRate(new TimerTask() {
+				@Override
+				public void run() {
+					log.info("Checking for boss participants");
+					client.getPlayers().forEach(player -> {
+						if (corp != null && player.getInteracting() != null && player.getInteracting().getName().equals(corp.getName())) {
+							log.info("Found participant: " + player.getName());
+							participants.add(player.getName());
+						}
+					});
+					createAndLogNewKillIfNotPresent();
+				}
+			},0,2500);
 		}
 	}
 
@@ -142,7 +169,9 @@ public class CorpEventTrackerPlugin extends Plugin {
 		if (npc == this.corp) {
 			log.info("Corporeal beast despawn: {}", npc);
 
+			this.checkForParticipantsTimer.cancel();
 			this.corp = null;
+
 			if (npc.isDead()) {
 				log.info("NPC Dead");
 				// Clear the kill instantly, but prevent the possibility of the
@@ -183,7 +212,28 @@ public class CorpEventTrackerPlugin extends Plugin {
 	public void onChatMessage(ChatMessage chatMessage) {
 		if (chatMessage.getType() == ChatMessageType.GAMEMESSAGE) {
 			// Example: <col=005f00>Prized received a drop: 175 x Onyx bolts (e)</col>
+			// Example: <col=ef1020>Valuable drop: 250 x Runite bolts (95,250 coins)</col>
+			Matcher matcherValuable = VALUABLE_DROP_MESSAGE.matcher(chatMessage.getMessage());
+
+			if (matcherValuable.lookingAt()) {
+				String player = client.getUsername();
+				int qty = 1;
+				String dropName = matcherValuable.group(1);
+
+				Matcher matcher2 = DROP_QTY.matcher(dropName);
+				if (matcher2.lookingAt()) {
+					qty = Integer.parseInt(matcher2.group(1).replaceAll(",", ""));
+					dropName = matcher2.group(2);
+				}
+
+				participants.add(player);
+				this.logAndClearKill(player, dropName, qty);
+
+				return;
+			}
+
 			Matcher matcher = DROP_MESSAGE.matcher(chatMessage.getMessage());
+			log.info("Chat message: " + chatMessage.getMessage());
 
 			// TODO - Handle gem drop and other multi-item drops
 			if (matcher.lookingAt()) {
@@ -198,7 +248,6 @@ public class CorpEventTrackerPlugin extends Plugin {
 				}
 
 				// Make sure the person who got the kill is in the list
-				// TODO - Understand why there are duplicates sometimes that have the same value
 				participants.add(player);
 
 				this.logAndClearKill(player, dropName, qty);
@@ -219,7 +268,6 @@ public class CorpEventTrackerPlugin extends Plugin {
 
 		this.participants.add(source.getName());
 		this.createAndLogNewKillIfNotPresent();
-		this.logInProgressKill();
 	}
 
 	@Subscribe
@@ -268,6 +316,9 @@ public class CorpEventTrackerPlugin extends Plugin {
 		this.participants.add("player 7");
 		this.killId = UUID.randomUUID();
 		logAndClearKill("Steven10172", "Elysian Sigil", 1);
+
+		this.killId = UUID.randomUUID();
+		logAndClearKill("Steven10172", "Spirit Shield", 1);
 
 		this.participants.add("player 8");
 		this.participants.add("player 9");
@@ -349,11 +400,22 @@ public class CorpEventTrackerPlugin extends Plugin {
 			return new BossTrackerItem(ItemID.COINS_995, "Coins", qty, 1, 1);
 		}
 
-		ItemPrice item = itemManager.search(dropName).get(0);
+		ItemPrice item = findItem(dropName);
 		long storePrice = itemManager.getItemComposition(item.getId()).getPrice();
 		int alchPrice = Math.round(storePrice * Constants.HIGH_ALCHEMY_MULTIPLIER);
 
 		return new BossTrackerItem(item.getId(), item.getName(), qty, item.getPrice(), alchPrice);
+	}
+
+	private ItemPrice findItem(String dropName) {
+		List<ItemPrice> items = itemManager.search(dropName);
+		for (ItemPrice item : items) {
+			if (item.getName().toLowerCase().equals(dropName.toLowerCase())) {
+				return item;
+			}
+		}
+
+		return null;
 	}
 
 	private void renderBossIcon(final int itemID, final int width, final int height) {
